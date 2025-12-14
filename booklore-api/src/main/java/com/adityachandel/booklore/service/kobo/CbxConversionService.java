@@ -1,5 +1,8 @@
 package com.adityachandel.booklore.service.kobo;
 
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import com.adityachandel.booklore.model.entity.AuthorEntity;
 import com.adityachandel.booklore.model.entity.BookEntity;
 import com.adityachandel.booklore.model.entity.CategoryEntity;
@@ -34,6 +37,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.Future;
 
 /**
  * Service for converting comic book archive files (CBX) to EPUB format.
@@ -48,12 +52,12 @@ import java.util.*;
  * <p>
  * Supported image formats within archives: JPG, JPEG, PNG, WEBP, GIF, BMP
  * </p>
- * 
+ *
  * <h3>Size Limits</h3>
  * <ul>
  *   <li>Maximum individual image size: 50 MB</li>
  * </ul>
- * 
+ *
  * @see KepubConversionService
  */
 @Slf4j
@@ -70,7 +74,7 @@ public class CbxConversionService {
     private static final String MIMETYPE_CONTENT = "application/epub+zip";
     private static final long MAX_IMAGE_SIZE_BYTES = 50L * 1024 * 1024;
     private static final String EXTRACTED_IMAGES_SUBDIR = "cbx_extracted_images";
-    
+
     private final Configuration freemarkerConfig;
 
     public CbxConversionService() {
@@ -91,7 +95,7 @@ public class CbxConversionService {
      *   <li>JPEG images are passed through directly; other formats are converted to JPEG (85% quality)</li>
      * </ol>
      * </p>
-     * 
+     *
      * @param cbxFile the comic book archive file (must be CBZ, CBR, or CB7)
      * @param tempDir the temporary directory where the output EPUB will be created
      * @param bookEntity the book metadata to include in the EPUB
@@ -105,19 +109,21 @@ public class CbxConversionService {
     public File convertCbxToEpub(File cbxFile, File tempDir, BookEntity bookEntity, int compressionPercentage)
             throws IOException, TemplateException, RarException {
         validateInputs(cbxFile, tempDir);
-        
+
         log.info("Starting CBX to EPUB conversion for: {}", cbxFile.getName());
-        
+
         File outputFile = executeCbxConversion(cbxFile, tempDir, bookEntity,compressionPercentage);
-        
+
         log.info("Successfully converted {} to {} (size: {} bytes)",
                 cbxFile.getName(), outputFile.getName(), outputFile.length());
         return outputFile;
     }
 
-    private File executeCbxConversion(File cbxFile, File tempDir, BookEntity bookEntity,int compressionPercentage)
+    private record PagePayload(int index, byte[] jpegBytes, byte[] htmlBytes) {}
+
+    private File executeCbxConversion(File cbxFile, File tempDir, BookEntity bookEntity, int compressionPercentage)
             throws IOException, TemplateException, RarException {
-        
+
         Path epubFilePath = Paths.get(tempDir.getAbsolutePath(), cbxFile.getName() + ".epub");
         File epubFile = epubFilePath.toFile();
 
@@ -129,25 +135,150 @@ public class CbxConversionService {
             throw new IllegalStateException("No valid images found in CBX file: " + cbxFile.getName());
         }
 
-        log.debug("Extracted {} images from CBX file to disk", imagePaths.size());
+        int threads = Math.max(2, Math.min(Runtime.getRuntime().availableProcessors(), 8));
+        ExecutorService pool = Executors.newFixedThreadPool(threads, new ThreadFactory() {
+            private final AtomicInteger n = new AtomicInteger(1);
+            @Override public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, "cbx-epub-worker-" + n.getAndIncrement());
+                t.setDaemon(true);
+                return t;
+            }
+        });
 
         try (ZipArchiveOutputStream zipOut = new ZipArchiveOutputStream(new FileOutputStream(epubFile))) {
             addMimetypeEntry(zipOut);
             addMetaInfContainer(zipOut);
             addStylesheet(zipOut);
-            
-            List<EpubContentFileGroup> contentGroups = addImagesAndPages(zipOut, imagePaths,compressionPercentage);
-            
+            List<EpubContentFileGroup> contentGroups =
+                    addImagesAndPagesParallel(zipOut, imagePaths, compressionPercentage, pool);
+
             addContentOpf(zipOut, bookEntity, contentGroups);
             addTocNcx(zipOut, bookEntity, contentGroups);
             addNavXhtml(zipOut, bookEntity, contentGroups);
+        } finally {
+            pool.shutdown();
+            try {
+                pool.awaitTermination(60, TimeUnit.SECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            deleteDirectory(extractedImagesDir);
         }
-
-        deleteDirectory(extractedImagesDir);
 
         return epubFile;
     }
-    
+
+    private List<EpubContentFileGroup> addImagesAndPagesParallel(
+            ZipArchiveOutputStream zipOut,
+            List<Path> imagePaths,
+            int compressionPercentage,
+            ExecutorService pool
+    ) throws IOException, TemplateException {
+
+        float quality = Math.max(0.0f, Math.min(1.0f, compressionPercentage / 100f));
+
+        @SuppressWarnings("unchecked")
+        Future<PagePayload>[] futures = new Future[imagePaths.size()];
+
+        for (int i = 0; i < imagePaths.size(); i++) {
+            final int index = i;
+            final Path src = imagePaths.get(i);
+
+            futures[i] = pool.submit(() -> {
+                byte[] jpegBytes = readAsJpegBytes(src, quality);
+                String contentKey = String.format("page-%04d", index + 1);
+                String imageFileName = contentKey + ".jpg";
+                String html = generatePageHtml(imageFileName, index + 1);
+                return new PagePayload(index, jpegBytes, html.getBytes(StandardCharsets.UTF_8));
+            });
+        }
+
+        List<EpubContentFileGroup> contentGroups = new ArrayList<>(imagePaths.size());
+        for (int i = 0; i < imagePaths.size(); i++) {
+            String contentKey = String.format("page-%04d", i + 1);
+            String imagePath = IMAGE_ROOT_PATH + contentKey + ".jpg";
+            String htmlPath = HTML_ROOT_PATH + contentKey + ".xhtml";
+            contentGroups.add(new EpubContentFileGroup(contentKey, imagePath, htmlPath));
+        }
+
+        PagePayload first = getFuture(futures[0]);
+        writeBytesEntry(zipOut, COVER_IMAGE_PATH, first.jpegBytes);
+
+        for (int i = 0; i < futures.length; i++) {
+            PagePayload payload = getFuture(futures[i]);
+            EpubContentFileGroup grp = contentGroups.get(i);
+
+            writeBytesEntry(zipOut, grp.imagePath(), payload.jpegBytes);
+            writeBytesEntry(zipOut, grp.htmlPath(), payload.htmlBytes);
+        }
+
+        return contentGroups;
+    }
+
+    private PagePayload getFuture(Future<PagePayload> f) throws IOException {
+        try {
+            return f.get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while building EPUB pages", ie);
+        } catch (ExecutionException ee) {
+            Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
+            if (cause instanceof IOException ioe) throw ioe;
+            throw new IOException("Failed while building EPUB pages", cause);
+        }
+    }
+
+    private void writeBytesEntry(ZipArchiveOutputStream zipOut, String path, byte[] bytes) throws IOException {
+        ZipArchiveEntry e = new ZipArchiveEntry(path);
+        zipOut.putArchiveEntry(e);
+        zipOut.write(bytes);
+        zipOut.closeArchiveEntry();
+    }
+
+    private byte[] readAsJpegBytes(Path sourceImagePath, float quality) throws IOException {
+        if (isJpegFile(sourceImagePath)) {
+            return Files.readAllBytes(sourceImagePath);
+        }
+        try (InputStream fis = Files.newInputStream(sourceImagePath)) {
+            BufferedImage image = ImageIO.read(fis);
+            if (image == null) {
+                return Files.readAllBytes(sourceImagePath);
+            }
+            return encodeBufferedImageToJpegBytes(image, quality);
+        }
+    }
+
+    private byte[] encodeBufferedImageToJpegBytes(BufferedImage image, float quality) throws IOException {
+        BufferedImage rgbImage = image;
+        if (image.getType() != BufferedImage.TYPE_INT_RGB) {
+            rgbImage = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_RGB);
+            rgbImage.getGraphics().drawImage(image, 0, 0, null);
+            rgbImage.getGraphics().dispose();
+        }
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(256 * 1024);
+
+        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
+        if (!writers.hasNext()) throw new IOException("No JPEG image writer available");
+        ImageWriter writer = writers.next();
+
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        if (param.canWriteCompressed()) {
+            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            param.setCompressionQuality(quality);
+        }
+
+        try (ImageOutputStream ios = ImageIO.createImageOutputStream(baos)) {
+            writer.setOutput(ios);
+            writer.write(null, new IIOImage(rgbImage, null, null), param);
+        } finally {
+            writer.dispose();
+        }
+
+        return baos.toByteArray();
+    }
+
+
     private void deleteDirectory(Path directory) {
         try {
             FileSystemUtils.deleteRecursively(directory);
@@ -162,10 +293,10 @@ public class CbxConversionService {
         }
 
         if (!isSupportedCbxFormat(cbxFile.getName())) {
-            throw new IllegalArgumentException("Unsupported file format: " + cbxFile.getName() + 
+            throw new IllegalArgumentException("Unsupported file format: " + cbxFile.getName() +
                     ". Supported formats: CBZ, CBR, CB7");
         }
-        
+
         if (tempDir == null || !tempDir.isDirectory()) {
             throw new IllegalArgumentException("Invalid temp directory: " + tempDir);
         }
@@ -183,7 +314,7 @@ public class CbxConversionService {
 
     private List<Path> extractImagesFromCbx(File cbxFile, Path extractedImagesDir) throws IOException, RarException {
         String fileName = cbxFile.getName().toLowerCase();
-        
+
         if (fileName.endsWith(".cbz")) {
             return extractImagesFromZip(cbxFile, extractedImagesDir);
         } else if (fileName.endsWith(".cbr")) {
@@ -194,18 +325,18 @@ public class CbxConversionService {
             throw new IllegalArgumentException("Unsupported archive format: " + fileName);
         }
     }
-    
+
     private List<Path> extractImagesFromZip(File cbzFile, Path extractedImagesDir) throws IOException {
         List<Path> imagePaths = new ArrayList<>();
-        
+
         try (ZipFile zipFile = ZipFile.builder().setFile(cbzFile).get()) {
             for (ZipArchiveEntry entry : Collections.list(zipFile.getEntries())) {
                 if (entry.isDirectory() || !isImageFile(entry.getName())) {
                     continue;
                 }
-                
+
                 validateImageSize(entry.getName(), entry.getSize());
-                
+
                 try (InputStream inputStream = zipFile.getInputStream(entry)) {
                     Path outputPath = extractedImagesDir.resolve(extractFileName(entry.getName()));
                     Files.copy(inputStream, outputPath);
@@ -215,23 +346,23 @@ public class CbxConversionService {
                 }
             }
         }
-        
+
         log.debug("Found {} image entries in CBZ file", imagePaths.size());
         imagePaths.sort(Comparator.comparing(path -> path.getFileName().toString().toLowerCase()));
         return imagePaths;
     }
-    
+
     private List<Path> extractImagesFromRar(File cbrFile, Path extractedImagesDir) throws IOException, RarException {
         List<Path> imagePaths = new ArrayList<>();
-        
+
         try (Archive rarFile = new Archive(cbrFile)) {
             for (FileHeader fileHeader : rarFile) {
                 if (fileHeader.isDirectory() || !isImageFile(fileHeader.getFileName())) {
                     continue;
                 }
-                
+
                 validateImageSize(fileHeader.getFileName(), fileHeader.getFullUnpackSize());
-                
+
                 try (InputStream inputStream = rarFile.getInputStream(fileHeader)) {
                     Path outputPath = extractedImagesDir.resolve(extractFileName(fileHeader.getFileName()));
                     Files.copy(inputStream, outputPath);
@@ -241,24 +372,24 @@ public class CbxConversionService {
                 }
             }
         }
-        
+
         log.debug("Found {} image entries in CBR file", imagePaths.size());
         imagePaths.sort(Comparator.comparing(path -> path.getFileName().toString().toLowerCase()));
         return imagePaths;
     }
-    
+
     private List<Path> extractImagesFrom7z(File cb7File, Path extractedImagesDir) throws IOException {
         List<Path> imagePaths = new ArrayList<>();
-        
+
         try (SevenZFile sevenZFile = SevenZFile.builder().setFile(cb7File).get()) {
             SevenZArchiveEntry entry;
             while ((entry = sevenZFile.getNextEntry()) != null) {
                 if (entry.isDirectory() || !isImageFile(entry.getName())) {
                     continue;
                 }
-                
+
                 validateImageSize(entry.getName(), entry.getSize());
-                
+
                 try {
                     Path outputPath = extractedImagesDir.resolve(extractFileName(entry.getName()));
                     try (InputStream entryInputStream = sevenZFile.getInputStream(entry);
@@ -271,16 +402,16 @@ public class CbxConversionService {
                 }
             }
         }
-        
+
         log.debug("Found {} image entries in CB7 file", imagePaths.size());
         imagePaths.sort(Comparator.comparing(path -> path.getFileName().toString().toLowerCase()));
         return imagePaths;
     }
-    
+
     private String extractFileName(String entryPath) {
         return Path.of(entryPath).getFileName().toString();
     }
-    
+
     private void validateImageSize(String imageName, long size) throws IOException {
         if (size > MAX_IMAGE_SIZE_BYTES) {
             throw new IOException(String.format("Image '%s' exceeds maximum size limit: %d bytes (max: %d bytes)",
@@ -313,7 +444,7 @@ public class CbxConversionService {
         mimetypeEntry.setMethod(ZipArchiveEntry.STORED);
         mimetypeEntry.setSize(mimetypeBytes.length);
         mimetypeEntry.setCrc(calculateCrc32(mimetypeBytes));
-        
+
         zipOut.putArchiveEntry(mimetypeEntry);
         zipOut.write(mimetypeBytes);
         zipOut.closeArchiveEntry();
@@ -322,9 +453,9 @@ public class CbxConversionService {
     private void addMetaInfContainer(ZipArchiveOutputStream zipOut) throws IOException, TemplateException {
         Map<String, Object> model = new HashMap<>();
         model.put("contentOpfPath", CONTENT_OPF_PATH);
-        
+
         String containerXml = processTemplate("xml/container.xml.ftl", model);
-        
+
         ZipArchiveEntry containerEntry = new ZipArchiveEntry("META-INF/container.xml");
         zipOut.putArchiveEntry(containerEntry);
         zipOut.write(containerXml.getBytes(StandardCharsets.UTF_8));
@@ -333,7 +464,7 @@ public class CbxConversionService {
 
     private void addStylesheet(ZipArchiveOutputStream zipOut) throws IOException {
         String stylesheetContent = loadResourceAsString("/templates/epub/css/stylesheet.css");
-        
+
         ZipArchiveEntry stylesheetEntry = new ZipArchiveEntry(STYLESHEET_CSS_PATH);
         zipOut.putArchiveEntry(stylesheetEntry);
         zipOut.write(stylesheetContent.getBytes(StandardCharsets.UTF_8));
@@ -342,7 +473,7 @@ public class CbxConversionService {
 
     private List<EpubContentFileGroup> addImagesAndPages(ZipArchiveOutputStream zipOut, List<Path> imagePaths,int compressionPercentage)
             throws IOException, TemplateException {
-        
+
         List<EpubContentFileGroup> contentGroups = new ArrayList<>();
 
         if (!imagePaths.isEmpty()) {
@@ -376,7 +507,7 @@ public class CbxConversionService {
             throws IOException {
         ZipArchiveEntry imageEntry = new ZipArchiveEntry(epubImagePath);
         zipOut.putArchiveEntry(imageEntry);
-        
+
         if (isJpegFile(sourceImagePath)) {
             try (InputStream fis = Files.newInputStream(sourceImagePath)) {
                 fis.transferTo(zipOut);
@@ -394,11 +525,11 @@ public class CbxConversionService {
                 }
             }
         }
-        
+
         zipOut.closeArchiveEntry();
     }
-    
-    private void writeJpegImage(BufferedImage image, ZipArchiveOutputStream zipOut, float quality) 
+
+    private void writeJpegImage(BufferedImage image, ZipArchiveOutputStream zipOut, float quality)
             throws IOException {
         BufferedImage rgbImage = image;
         if (image.getType() != BufferedImage.TYPE_INT_RGB) {
@@ -406,9 +537,9 @@ public class CbxConversionService {
             rgbImage.getGraphics().drawImage(image, 0, 0, null);
             rgbImage.getGraphics().dispose();
         }
-        
+
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        
+
         Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
         if (!writers.hasNext()) {
             throw new IOException("No JPEG image writer available");
@@ -416,19 +547,19 @@ public class CbxConversionService {
         ImageWriter writer = writers.next();
 
         ImageWriteParam param = writer.getDefaultWriteParam();
-        
+
         if (param.canWriteCompressed()) {
             param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
             param.setCompressionQuality(quality);
         }
-        
+
         try (ImageOutputStream ios = ImageIO.createImageOutputStream(baos)) {
             writer.setOutput(ios);
             writer.write(null, new IIOImage(rgbImage, null, null), param);
         } finally {
             writer.dispose();
         }
-        
+
         zipOut.write(baos.toByteArray());
     }
 
@@ -437,15 +568,15 @@ public class CbxConversionService {
         model.put("imageFileName", "../Images/" + imageFileName);
         model.put("pageNumber", pageNumber);
         model.put("stylesheetPath", "../Styles/stylesheet.css");
-        
+
         return processTemplate("xml/image_page.xhtml.ftl", model);
     }
 
-    private void addContentOpf(ZipArchiveOutputStream zipOut, BookEntity bookEntity, 
+    private void addContentOpf(ZipArchiveOutputStream zipOut, BookEntity bookEntity,
                               List<EpubContentFileGroup> contentGroups) throws IOException, TemplateException {
-        
+
         Map<String, Object> model = createBookMetadataModel(bookEntity);
-        
+
         List<EpubContentFileGroup> relativeContentGroups = contentGroups.stream()
                 .map(group -> new EpubContentFileGroup(
                         group.contentKey(),
@@ -453,44 +584,44 @@ public class CbxConversionService {
                         makeRelativeToOebps(group.htmlPath())
                 ))
                 .toList();
-        
+
         model.put("contentFileGroups", relativeContentGroups);
         model.put("coverImagePath", makeRelativeToOebps(COVER_IMAGE_PATH));
         model.put("tocNcxPath", makeRelativeToOebps(TOC_NCX_PATH));
         model.put("navXhtmlPath", makeRelativeToOebps(NAV_XHTML_PATH));
         model.put("stylesheetCssPath", makeRelativeToOebps(STYLESHEET_CSS_PATH));
         model.put("firstPageId", contentGroups.isEmpty() ? "" : "page_" + contentGroups.getFirst().contentKey());
-        
+
         String contentOpf = processTemplate("xml/content.opf.ftl", model);
-        
+
         ZipArchiveEntry contentEntry = new ZipArchiveEntry(CONTENT_OPF_PATH);
         zipOut.putArchiveEntry(contentEntry);
         zipOut.write(contentOpf.getBytes(StandardCharsets.UTF_8));
         zipOut.closeArchiveEntry();
     }
 
-    private void addTocNcx(ZipArchiveOutputStream zipOut, BookEntity bookEntity, 
+    private void addTocNcx(ZipArchiveOutputStream zipOut, BookEntity bookEntity,
                           List<EpubContentFileGroup> contentGroups) throws IOException, TemplateException {
-        
+
         Map<String, Object> model = createBookMetadataModel(bookEntity);
         model.put("contentFileGroups", contentGroups);
-        
+
         String tocNcx = processTemplate("xml/toc.xml.ftl", model);
-        
+
         ZipArchiveEntry tocEntry = new ZipArchiveEntry(TOC_NCX_PATH);
         zipOut.putArchiveEntry(tocEntry);
         zipOut.write(tocNcx.getBytes(StandardCharsets.UTF_8));
         zipOut.closeArchiveEntry();
     }
 
-    private void addNavXhtml(ZipArchiveOutputStream zipOut, BookEntity bookEntity, 
+    private void addNavXhtml(ZipArchiveOutputStream zipOut, BookEntity bookEntity,
                             List<EpubContentFileGroup> contentGroups) throws IOException, TemplateException {
-        
+
         Map<String, Object> model = createBookMetadataModel(bookEntity);
         model.put("contentFileGroups", contentGroups);
-        
+
         String navXhtml = processTemplate("xml/nav.xhtml.ftl", model);
-        
+
         ZipArchiveEntry navEntry = new ZipArchiveEntry(NAV_XHTML_PATH);
         zipOut.putArchiveEntry(navEntry);
         zipOut.write(navXhtml.getBytes(StandardCharsets.UTF_8));
@@ -499,20 +630,20 @@ public class CbxConversionService {
 
     private Map<String, Object> createBookMetadataModel(BookEntity bookEntity) {
         Map<String, Object> model = new HashMap<>();
-        
+
         if (bookEntity != null && bookEntity.getMetadata() != null) {
             var metadata = bookEntity.getMetadata();
-            
+
             model.put("title", metadata.getTitle() != null ? metadata.getTitle() : "Unknown Comic");
             model.put("language", metadata.getLanguage() != null ? metadata.getLanguage() : "en");
-            
+
             if (metadata.getSubtitle() != null && !metadata.getSubtitle().trim().isEmpty()) {
                 model.put("subtitle", metadata.getSubtitle());
             }
             if (metadata.getDescription() != null && !metadata.getDescription().trim().isEmpty()) {
                 model.put("description", metadata.getDescription());
             }
-            
+
             if (metadata.getSeriesName() != null && !metadata.getSeriesName().trim().isEmpty()) {
                 model.put("seriesName", metadata.getSeriesName());
             }
@@ -522,7 +653,7 @@ public class CbxConversionService {
             if (metadata.getSeriesTotal() != null) {
                 model.put("seriesTotal", metadata.getSeriesTotal());
             }
-            
+
             if (metadata.getPublisher() != null && !metadata.getPublisher().trim().isEmpty()) {
                 model.put("publisher", metadata.getPublisher());
             }
@@ -532,7 +663,7 @@ public class CbxConversionService {
             if (metadata.getPageCount() != null && metadata.getPageCount() > 0) {
                 model.put("pageCount", metadata.getPageCount());
             }
-            
+
             if (metadata.getIsbn13() != null && !metadata.getIsbn13().trim().isEmpty()) {
                 model.put("isbn13", metadata.getIsbn13());
             }
@@ -545,38 +676,38 @@ public class CbxConversionService {
             if (metadata.getGoodreadsId() != null && !metadata.getGoodreadsId().trim().isEmpty()) {
                 model.put("goodreadsId", metadata.getGoodreadsId());
             }
-            
+
             if (metadata.getAuthors() != null && !metadata.getAuthors().isEmpty()) {
                 model.put("authors", metadata.getAuthors().stream()
                         .map(AuthorEntity::getName)
                         .toList());
             }
-            
+
             if (metadata.getCategories() != null && !metadata.getCategories().isEmpty()) {
                 model.put("categories", metadata.getCategories().stream()
                         .map(CategoryEntity::getName)
                         .toList());
             }
-            
+
             if (metadata.getTags() != null && !metadata.getTags().isEmpty()) {
                 model.put("tags", metadata.getTags().stream()
                         .map(TagEntity::getName)
                         .toList());
             }
-            
+
             model.put("identifier", "urn:uuid:" + UUID.randomUUID());
         } else {
             model.put("title", "Unknown Comic");
             model.put("language", "en");
             model.put("identifier", "urn:uuid:" + UUID.randomUUID());
         }
-        
+
         model.put("modified", Instant.now().toString());
-        
+
         return model;
     }
 
-    private String processTemplate(String templateName, Map<String, Object> model) 
+    private String processTemplate(String templateName, Map<String, Object> model)
             throws IOException, TemplateException {
         try {
             Template template = freemarkerConfig.getTemplate(templateName);
@@ -602,11 +733,11 @@ public class CbxConversionService {
     private String makeRelativeToOebps(String fullPath) {
         Path oebpsPath = Paths.get("OEBPS");
         Path targetPath = Paths.get(fullPath);
-        
+
         if (targetPath.startsWith(oebpsPath)) {
             return oebpsPath.relativize(targetPath).toString().replace('\\', '/');
         }
-        
+
         return fullPath;
     }
 
@@ -621,8 +752,8 @@ public class CbxConversionService {
             return false;
         }
         String lowerName = fileName.toLowerCase();
-        return lowerName.endsWith(".cbz") || 
-               lowerName.endsWith(".cbr") || 
+        return lowerName.endsWith(".cbz") ||
+               lowerName.endsWith(".cbr") ||
                lowerName.endsWith(".cb7");
     }
 
